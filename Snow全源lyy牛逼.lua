@@ -1,5 +1,3 @@
---Snow全源
---by lyy
 local EditableService = game:GetService("EditableService")
 if not game:IsLoaded() then game.Loaded:Wait() end
 local WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/454244513/WindUIFix/refs/heads/main/main.lua"))()
