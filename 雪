@@ -1,0 +1,1056 @@
+--[[
+================================================================
+ Snow 全源 · 修复版 v2（独立构建）
+ 原版：a498516f-...-心.lua (666 行)
+ 本版目标：
+   1. 不依赖已 404 的 WindUI / admin / kick 远端
+   2. 修掉会直接崩溃/功能失效的 11 处硬伤
+   3. 所有连接、实例、全局状态可回收，支持重复注入
+   4. 保留原版功能集：飞行 / 加速 / 透明 / 第三人称 /
+      连跳 / 穿墙 / 防虚空 / ESP
+ 用法：注入执行即可，面板左上角，标题栏可拖拽。
+================================================================
+]]
+
+--==================== 0. 环境守卫 ====================
+if not game or not game.GetService then
+    return
+end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local Stats = game:GetService("Stats")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    LocalPlayer = Players:WaitForChild("LocalPlayer", 10)
+end
+if not LocalPlayer then
+    return
+end
+
+local playerGui = LocalPlayer:WaitForChild("PlayerGui", 15)
+if not playerGui then
+    return
+end
+
+pcall(function()
+    if setfpscap then setfpscap(240) end
+end)
+
+--==================== 1. 配置 ====================
+local CONFIG = {
+    OFFSET = 0x1BFA3,
+    PANEL_NAME = "SnowPanelV2",
+    -- 远端配置默认关闭：原地址已 404，且 loadstring(远程) 等于把执行权交给仓库主人
+    remote = {
+        enabled = false,
+        adminUrl = "https://raw.githubusercontent.com/canxiaoxue666/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB/refs/heads/main/admin",
+        kickUrl  = "https://raw.githubusercontent.com/canxiaoxue666/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB/refs/heads/main/kick",
+    },
+    espInterval = 0.12,
+    antiVoidPush = 140,
+    antiVoidMargin = 25,
+}
+
+--==================== 2. 安全工具 ====================
+local function safeCall(fn, ...)
+    local ok, res = pcall(fn, ...)
+    if ok then
+        return res
+    end
+    return nil
+end
+
+local function getChar()
+    return LocalPlayer.Character
+end
+
+local function getHum()
+    local ch = LocalPlayer.Character
+    if not ch then return nil end
+    return ch:FindFirstChildOfClass("Humanoid")
+end
+
+local function getRoot()
+    local ch = LocalPlayer.Character
+    if not ch then return nil end
+    local r = ch:FindFirstChild("HumanoidRootPart")
+    if r then return r end
+    return ch:FindFirstChildWhichIsA("BasePart")
+end
+
+-- 带超时的 WaitForChild，避免原版无超时死等
+local function waitFor(parent, name, timeout)
+    if not parent then return nil end
+    local inst = parent:FindFirstChild(name)
+    if inst then return inst end
+    local ok, res = pcall(function()
+        return parent:WaitForChild(name, timeout or 5)
+    end)
+    if ok then return res end
+    return parent:FindFirstChild(name)
+end
+
+--==================== 3. 通知（屏幕 + 控制台） ====================
+local notifLayer
+
+local function notify(title, content)
+    local text = string.format("[Snow] %s | %s", tostring(title), tostring(content))
+    pcall(function() print(text) end)
+
+    if notifLayer and notifLayer.Parent then
+        local box = Instance.new("TextLabel")
+        box.Size = UDim2.new(0, 300, 0, 34)
+        box.Position = UDim2.new(1, -320, 1, -60)
+        box.BackgroundColor3 = Color3.fromRGB(18, 26, 40)
+        box.BackgroundTransparency = 0.1
+        box.BorderSizePixel = 0
+        box.Font = Enum.Font.GothamMedium
+        box.TextSize = 12
+        box.TextWrapped = true
+        box.TextColor3 = Color3.fromRGB(220, 236, 255)
+        box.Text = "【" .. tostring(title) .. "】" .. tostring(content)
+        box.Parent = notifLayer
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 6)
+        c.Parent = box
+        task.delay(3, function()
+            if box and box.Parent then box:Destroy() end
+        end)
+    end
+end
+
+--==================== 4. 本地校验（仅为混淆，不是安全边界） ====================
+local function generateKey()
+    local ok, v = pcall(function()
+        return (bit32.bxor(game.GameId % 4294967296, game.PlaceId % 4294967296) + CONFIG.OFFSET) * 2
+    end)
+    if ok then return v end
+    return 0
+end
+
+local function secureCheck(...)
+    if select("#", ...) ~= 1 then
+        return false
+    end
+    local key = ...
+    if type(key) ~= "number" then return false end
+    return key == generateKey()
+end
+
+--==================== 5. 状态表 ====================
+local S = {
+    fly = { on = false, speed = 50, bv = nil, bg = nil, conn = nil },
+    walk = { on = false, speed = 10, conn = nil },
+    noclip = false,
+    invis = { on = false, conn = nil, backup = {} },
+    jump = { on = false, conn = nil },
+    third = { on = false, saved = nil },
+    antiVoid = false,
+    esp = { on = true, cache = {}, name = true, dist = true, hp = true },
+}
+
+--==================== 6. UI 构建 ====================
+local oldPanel = playerGui:FindFirstChild(CONFIG.PANEL_NAME)
+if oldPanel then
+    oldPanel:Destroy()
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = CONFIG.PANEL_NAME
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = playerGui
+
+notifLayer = gui
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.new(0, 320, 0, 430)
+main.Position = UDim2.new(0, 20, 0, 60)
+main.BackgroundColor3 = Color3.fromRGB(15, 21, 33)
+main.BackgroundTransparency = 0.05
+main.BorderSizePixel = 0
+main.Active = true
+main.ClipsDescendants = true
+main.Parent = gui
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 10)
+    c.Parent = main
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(46, 72, 110)
+    stroke.Thickness = 1
+    stroke.Parent = main
+end
+
+local titleBar = Instance.new("Frame")
+titleBar.Name = "TitleBar"
+titleBar.Size = UDim2.new(1, 0, 0, 34)
+titleBar.BackgroundColor3 = Color3.fromRGB(26, 37, 55)
+titleBar.BorderSizePixel = 0
+titleBar.Parent = main
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 10)
+    c.Parent = titleBar
+end
+
+local titleLabel = Instance.new("TextLabel")
+titleLabel.Size = UDim2.new(1, -70, 1, 0)
+titleLabel.Position = UDim2.new(0, 10, 0, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Font = Enum.Font.GothamBold
+titleLabel.TextSize = 13
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.TextColor3 = Color3.fromRGB(226, 240, 255)
+titleLabel.Text = "Snow Script  v2  ·  独立构建"
+titleLabel.Parent = titleBar
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 22, 0, 22)
+closeBtn.Position = UDim2.new(1, -28, 0, 6)
+closeBtn.BackgroundColor3 = Color3.fromRGB(70, 40, 46)
+closeBtn.BorderSizePixel = 0
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 12
+closeBtn.TextColor3 = Color3.fromRGB(255, 210, 210)
+closeBtn.Text = "X"
+closeBtn.Parent = titleBar
+do
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 5)
+    c.Parent = closeBtn
+end
+
+local scroll = Instance.new("ScrollingFrame")
+scroll.Name = "Body"
+scroll.Size = UDim2.new(1, -12, 1, -44)
+scroll.Position = UDim2.new(0, 6, 0, 38)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 4
+scroll.ScrollBarImageColor3 = Color3.fromRGB(70, 110, 160)
+scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroll.Parent = main
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 6)
+listLayout.SortOrder = Enum.SortOrder.LayoutOrder
+listLayout.Parent = scroll
+
+local listPad = Instance.new("UIPadding")
+listPad.PaddingTop = UDim.new(0, 4)
+listPad.PaddingBottom = UDim.new(0, 8)
+listPad.Parent = scroll
+
+local layoutOrder = 0
+local function nextOrder()
+    layoutOrder = layoutOrder + 1
+    return layoutOrder
+end
+
+-- 拖拽
+do
+    local dragging = false
+    local dragStart = nil
+    local startPos = nil
+    titleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = main.Position
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if not dragging or not dragStart then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            local delta = input.Position - dragStart
+            main.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+    UIS.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+            dragStart = nil
+        end
+    end)
+end
+
+closeBtn.MouseButton1Click:Connect(function()
+    gui.Enabled = false
+end)
+
+--==================== 7. 控件工厂 ====================
+local function makeSection(text)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -8, 0, 22)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextSize = 11
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextColor3 = Color3.fromRGB(110, 160, 220)
+    lbl.Text = "— " .. text
+    lbl.LayoutOrder = nextOrder()
+    lbl.Parent = scroll
+    return lbl
+end
+
+local function makeToggle(text, default, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -8, 0, 30)
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamMedium
+    btn.TextSize = 12
+    btn.TextXAlignment = Enum.TextXAlignment.Left
+    btn.TextColor3 = Color3.fromRGB(222, 236, 252)
+    btn.AutoButtonColor = false
+    btn.LayoutOrder = nextOrder()
+    btn.Parent = scroll
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 6)
+        c.Parent = btn
+        local p = Instance.new("UIPadding")
+        p.PaddingLeft = UDim.new(0, 10)
+        p.Parent = btn
+    end
+
+    local on = default and true or false
+
+    local function render()
+        btn.Text = text .. (on and "    ● 开" or "    ○ 关")
+        if on then
+            btn.BackgroundColor3 = Color3.fromRGB(30, 96, 150)
+        else
+            btn.BackgroundColor3 = Color3.fromRGB(28, 38, 56)
+        end
+    end
+
+    btn.MouseButton1Click:Connect(function()
+        on = not on
+        render()
+        if callback then
+            local ok, err = pcall(callback, on)
+            if not ok then
+                notify("错误", tostring(err))
+            end
+        end
+    end)
+
+    render()
+    return {
+        Set = function(v)
+            on = v and true or false
+            render()
+            if callback then pcall(callback, on) end
+        end,
+        Get = function() return on end,
+    }
+end
+
+local function makeButton(text, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -8, 0, 30)
+    btn.BackgroundColor3 = Color3.fromRGB(34, 50, 74)
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamMedium
+    btn.TextSize = 12
+    btn.TextColor3 = Color3.fromRGB(226, 240, 255)
+    btn.Text = text
+    btn.LayoutOrder = nextOrder()
+    btn.Parent = scroll
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 6)
+        c.Parent = btn
+    end
+    btn.MouseButton1Click:Connect(function()
+        local ok, err = pcall(callback)
+        if not ok then notify("错误", tostring(err)) end
+    end)
+    return btn
+end
+
+local function makeSlider(text, minValue, maxValue, default, callback)
+    if maxValue <= minValue then
+        maxValue = minValue + 1
+    end
+
+    local holder = Instance.new("Frame")
+    holder.Size = UDim2.new(1, -8, 0, 46)
+    holder.BackgroundColor3 = Color3.fromRGB(28, 38, 56)
+    holder.BorderSizePixel = 0
+    holder.LayoutOrder = nextOrder()
+    holder.Parent = scroll
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 6)
+        c.Parent = holder
+    end
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -16, 0, 20)
+    lbl.Position = UDim2.new(0, 8, 0, 3)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.GothamMedium
+    lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextColor3 = Color3.fromRGB(214, 230, 248)
+    lbl.Parent = holder
+
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(1, -16, 0, 9)
+    bar.Position = UDim2.new(0, 8, 0, 28)
+    bar.BackgroundColor3 = Color3.fromRGB(46, 60, 84)
+    bar.BorderSizePixel = 0
+    bar.Parent = holder
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 4)
+        c.Parent = bar
+    end
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new(0, 0, 1, 0)
+    fill.BackgroundColor3 = Color3.fromRGB(76, 201, 240)
+    fill.BorderSizePixel = 0
+    fill.Parent = bar
+    do
+        local c = Instance.new("UICorner")
+        c.CornerRadius = UDim.new(0, 4)
+        c.Parent = fill
+    end
+
+    local value = default
+
+    local function apply(v, fire)
+        v = math.clamp(v, minValue, maxValue)
+        value = v
+        local alpha = (v - minValue) / (maxValue - minValue)
+        fill.Size = UDim2.new(alpha, 0, 1, 0)
+        lbl.Text = string.format("%s : %d", text, math.floor(v + 0.5))
+        if fire and callback then
+            local ok, err = pcall(callback, v)
+            if not ok then notify("错误", tostring(err)) end
+        end
+    end
+
+    local dragging = false
+
+    local function fromInput(input)
+        local width = math.max(bar.AbsoluteSize.X, 1)
+        local rel = (input.Position.X - bar.AbsolutePosition.X) / width
+        rel = math.clamp(rel, 0, 1)
+        apply(minValue + rel * (maxValue - minValue), true)
+    end
+
+    bar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            fromInput(input)
+        end
+    end)
+
+    UIS.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            fromInput(input)
+        end
+    end)
+
+    UIS.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    apply(default, false)
+
+    return {
+        Set = function(v) apply(v, true) end,
+        Get = function() return value end,
+    }
+end
+
+--==================== 8. 功能实现 ====================
+
+-- 8.1 飞行
+local function stopFly()
+    S.fly.on = false
+    if S.fly.conn then
+        pcall(function() S.fly.conn:Disconnect() end)
+        S.fly.conn = nil
+    end
+    if S.fly.bv then
+        pcall(function() S.fly.bv:Destroy() end)
+        S.fly.bv = nil
+    end
+    if S.fly.bg then
+        pcall(function() S.fly.bg:Destroy() end)
+        S.fly.bg = nil
+    end
+    local hum = getHum()
+    if hum then
+        pcall(function() hum.PlatformStand = false end)
+    end
+end
+
+local function startFly()
+    if S.fly.on then return end
+    local ch = getChar()
+    if not ch then
+        notify("系统", "角色未就绪，无法起飞")
+        return
+    end
+    local hum = getHum()
+    local root = getRoot()
+    if not hum or not root then
+        notify("系统", "缺少 Humanoid / RootPart")
+        return
+    end
+
+    S.fly.on = true
+    pcall(function() hum.PlatformStand = true end)
+
+    local bv = Instance.new("BodyVelocity")
+    bv.Name = "SnowFlyVelocity"
+    bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+    bv.Velocity = Vector3.zero
+    bv.Parent = root
+    S.fly.bv = bv
+
+    local bg = Instance.new("BodyGyro")
+    bg.Name = "SnowFlyGyro"
+    bg.MaxTorque = Vector3.new(9e9, 9e9, 9e9)
+    bg.P = 3000
+    bg.D = 60
+    bg.Parent = root
+    S.fly.bg = bg
+
+    S.fly.conn = RunService.RenderStepped:Connect(function()
+        if not S.fly.on then return end
+        local curRoot = getRoot()
+        if not curRoot or not S.fly.bv or not S.fly.bg then
+            stopFly()
+            return
+        end
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+
+        local dir = Vector3.zero
+        if UIS:IsKeyDown(Enum.KeyCode.W) then dir = dir + cam.CFrame.LookVector end
+        if UIS:IsKeyDown(Enum.KeyCode.S) then dir = dir - cam.CFrame.LookVector end
+        if UIS:IsKeyDown(Enum.KeyCode.A) then dir = dir - cam.CFrame.RightVector end
+        if UIS:IsKeyDown(Enum.KeyCode.D) then dir = dir + cam.CFrame.RightVector end
+        if UIS:IsKeyDown(Enum.KeyCode.Space) then dir = dir + Vector3.new(0, 1, 0) end
+        if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then dir = dir - Vector3.new(0, 1, 0) end
+        if dir.Magnitude > 0 then
+            dir = dir.Unit
+        end
+        S.fly.bv.Velocity = dir * S.fly.speed
+
+        local look = curRoot.Position + cam.CFrame.LookVector
+        if (look - curRoot.Position).Magnitude > 0.01 then
+            S.fly.bg.CFrame = CFrame.lookAt(curRoot.Position, look)
+        end
+    end)
+end
+
+-- 8.2 加速（客户端位移）
+local function stopWalk()
+    S.walk.on = false
+    if S.walk.conn then
+        pcall(function() S.walk.conn:Disconnect() end)
+        S.walk.conn = nil
+    end
+end
+
+local function startWalk()
+    if S.walk.on then return end
+    S.walk.on = true
+    S.walk.conn = RunService.Stepped:Connect(function(_, deltaTime)
+        if not S.walk.on then return end
+        local hum = getHum()
+        local ch = getChar()
+        if not hum or not ch then return end
+        if hum.MoveDirection.Magnitude > 0 then
+            local step = hum.MoveDirection * S.walk.speed * deltaTime * 10
+            pcall(function() ch:TranslateBy(step) end)
+        end
+    end)
+end
+
+-- 8.3 透明
+local function stopInvis()
+    if S.invis.conn then
+        pcall(function() S.invis.conn:Disconnect() end)
+        S.invis.conn = nil
+    end
+    S.invis.on = false
+    local ch = getChar()
+    if ch then
+        for part, data in pairs(S.invis.backup) do
+            if typeof(part) == "Instance" and part.Parent then
+                pcall(function()
+                    part.Transparency = data.t
+                    part.Material = data.m
+                    part.Color = data.c
+                end)
+            end
+        end
+    end
+    table.clear(S.invis.backup)
+end
+
+local function startInvis()
+    if S.invis.on then return end
+    S.invis.on = true
+    S.invis.conn = RunService.Heartbeat:Connect(function()
+        if not S.invis.on then return end
+        local ch = getChar()
+        if not ch then return end
+        local hue = (os.clock() % 5) / 5
+        local rainbow = Color3.fromHSV(hue, 1, 1)
+        for _, part in ipairs(ch:GetDescendants()) do
+            if part:IsA("BasePart") then
+                if part.Name == "Head" then
+                    if S.invis.backup[part] == nil then
+                        S.invis.backup[part] = { t = part.Transparency, m = part.Material, c = part.Color }
+                    end
+                    part.Transparency = 1
+                    local face = part:FindFirstChild("face")
+                    if face then pcall(function() face:Destroy() end) end
+                elseif part.Name ~= "HumanoidRootPart" then
+                    if S.invis.backup[part] == nil then
+                        S.invis.backup[part] = { t = part.Transparency, m = part.Material, c = part.Color }
+                    end
+                    part.Material = Enum.Material.ForceField
+                    part.Color = rainbow
+                    part.Transparency = 0.5
+                end
+            end
+        end
+    end)
+end
+
+-- 8.4 第三人称
+local function applyThird(on)
+    S.third.on = on
+    if on then
+        if not S.third.saved then
+            S.third.saved = {
+                mode = LocalPlayer.CameraMode,
+                max = LocalPlayer.CameraMaxZoomDistance,
+                min = LocalPlayer.CameraMinZoomDistance,
+            }
+        end
+        pcall(function()
+            LocalPlayer.CameraMode = Enum.CameraMode.Classic
+            LocalPlayer.CameraMaxZoomDistance = 20
+            LocalPlayer.CameraMinZoomDistance = 3
+        end)
+    else
+        local saved = S.third.saved
+        pcall(function()
+            if saved then
+                LocalPlayer.CameraMode = saved.mode
+                LocalPlayer.CameraMaxZoomDistance = saved.max
+                LocalPlayer.CameraMinZoomDistance = saved.min
+            else
+                LocalPlayer.CameraMode = Enum.CameraMode.Classic
+            end
+        end)
+        S.third.saved = nil
+    end
+end
+
+-- 8.5 连跳
+local function applyJump(on)
+    S.jump.on = on
+    if S.jump.conn then
+        pcall(function() S.jump.conn:Disconnect() end)
+        S.jump.conn = nil
+    end
+    if on then
+        S.jump.conn = UIS.JumpRequest:Connect(function()
+            if not S.jump.on then return end
+            local hum = getHum()
+            if hum and hum.Health > 0 then
+                pcall(function() hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+            end
+        end)
+    end
+end
+
+-- 8.6 穿墙
+local function applyNoclip()
+    local ch = getChar()
+    if not ch then return end
+    local value = not S.noclip
+    for _, part in ipairs(ch:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.CanCollide = value
+        end
+    end
+end
+
+-- 8.7 防虚空
+local function antiVoidTick()
+    if not S.antiVoid then return end
+    local root = getRoot()
+    if not root then return end
+    local destroyHeight = workspace.FallenPartsDestroyHeight
+    if destroyHeight ~= destroyHeight then  -- NaN 保护
+        return
+    end
+    if root.Position.Y <= destroyHeight + CONFIG.antiVoidMargin then
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.new(0, CONFIG.antiVoidPush, 0)
+        end)
+    end
+end
+
+-- 8.8 ESP
+local function clearESP()
+    for char, rec in pairs(S.esp.cache) do
+        if rec.gui then
+            pcall(function() rec.gui:Destroy() end)
+        end
+        S.esp.cache[char] = nil
+    end
+end
+
+local function updateESP()
+    if not S.esp.on then
+        clearESP()
+        return
+    end
+
+    local myRoot = getRoot()
+    if not myRoot then return end
+
+    local alive = {}
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            local ch = plr.Character
+            if ch then
+                local head = ch:FindFirstChild("Head") or ch:FindFirstChildWhichIsA("BasePart")
+                local root = ch:FindFirstChild("HumanoidRootPart") or head
+                if head and root then
+                    alive[ch] = true
+                    local rec = S.esp.cache[ch]
+                    if not rec then
+                        local bb = Instance.new("BillboardGui")
+                        bb.Name = "SnowESP"
+                        bb.Size = UDim2.new(0, 220, 0, 52)
+                        bb.StudsOffsetWorldSpace = Vector3.new(0, 2.6, 0)
+                        bb.AlwaysOnTop = true
+                        bb.MaxDistance = 3000
+                        bb.Parent = head
+
+                        local lbl = Instance.new("TextLabel")
+                        lbl.Size = UDim2.new(1, 0, 1, 0)
+                        lbl.BackgroundTransparency = 1
+                        lbl.Font = Enum.Font.Gotham
+                        lbl.TextSize = 12
+                        lbl.RichText = true
+                        lbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+                        lbl.TextStrokeTransparency = 0.35
+                        lbl.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+                        lbl.TextYAlignment = Enum.TextYAlignment.Top
+                        lbl.Text = plr.Name
+                        lbl.Parent = bb
+
+                        rec = { gui = bb, label = lbl }
+                        S.esp.cache[ch] = rec
+                    end
+
+                    local dist = math.floor((root.Position - myRoot.Position).Magnitude + 0.5)
+                    local hum = ch:FindFirstChildOfClass("Humanoid")
+                    local hp = 0
+                    local mhp = 0
+                    if hum then
+                        hp = math.floor(hum.Health + 0.5)
+                        mhp = math.floor(hum.MaxHealth + 0.5)
+                    end
+
+                    local lines = {}
+                    if S.esp.name then
+                        table.insert(lines, plr.Name)
+                    end
+                    if S.esp.dist then
+                        table.insert(lines, string.format("距离 %dm", dist))
+                    end
+                    if S.esp.hp then
+                        local ratio = 1
+                        if mhp > 0 then ratio = hp / mhp end
+                        local r = math.floor((1 - ratio) * 255)
+                        local g = math.floor(ratio * 255)
+                        table.insert(lines, string.format("<font color='rgb(%d,%d,0)'>HP %d/%d</font>", r, g, hp, mhp))
+                    end
+                    rec.label.Text = table.concat(lines, "\n")
+                end
+            end
+        end
+    end
+
+    for char, rec in pairs(S.esp.cache) do
+        if not alive[char] then
+            if rec.gui then pcall(function() rec.gui:Destroy() end) end
+            S.esp.cache[char] = nil
+        end
+    end
+end
+
+--==================== 9. 状态面板 ====================
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.new(1, -8, 0, 20)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Font = Enum.Font.Code
+statusLabel.TextSize = 11
+statusLabel.TextColor3 = Color3.fromRGB(140, 190, 240)
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.Text = "FPS 0  |  PING 0ms"
+statusLabel.LayoutOrder = nextOrder()
+statusLabel.Parent = scroll
+
+--==================== 10. 绑定 UI ====================
+makeSection("飞行")
+makeSlider("飞行速度", 10, 300, S.fly.speed, function(v)
+    S.fly.speed = v
+end)
+makeToggle("飞行模式", false, function(on)
+    if on then startFly() else stopFly() end
+end)
+
+makeSection("移动")
+makeSlider("移动倍速", 1, 120, S.walk.speed, function(v)
+    S.walk.speed = v
+end)
+makeToggle("加速位移", false, function(on)
+    if on then startWalk() else stopWalk() end
+end)
+makeToggle("连跳", false, function(on)
+    applyJump(on)
+end)
+makeToggle("穿墙", false, function(on)
+    S.noclip = on
+    applyNoclip()
+end)
+makeToggle("防虚空", false, function(on)
+    S.antiVoid = on
+end)
+
+makeSection("视觉")
+makeToggle("透明彩虹", false, function(on)
+    if on then startInvis() else stopInvis() end
+end)
+makeToggle("第三人称", false, function(on)
+    applyThird(on)
+end)
+makeToggle("ESP 总开关", true, function(on)
+    S.esp.on = on
+    if not on then clearESP() end
+end)
+makeToggle("显示名字", true, function(on) S.esp.name = on end)
+makeToggle("显示距离", true, function(on) S.esp.dist = on end)
+makeToggle("显示血量", true, function(on) S.esp.hp = on end)
+
+makeSection("工具")
+makeButton("重置角色相关状态", function()
+    stopFly()
+    stopWalk()
+    stopInvis()
+    applyJump(false)
+    S.noclip = false
+    S.antiVoid = false
+    applyThird(false)
+    clearESP()
+    notify("系统", "全部状态已重置")
+end)
+makeButton("销毁面板", function()
+    stopFly()
+    stopWalk()
+    stopInvis()
+    applyJump(false)
+    clearESP()
+    pcall(function() gui:Destroy() end)
+end)
+
+--==================== 11. 角色事件 ====================
+local function onCharacterAdded(character)
+    if not character then return end
+    local hum = character:FindFirstChildOfClass("Humanoid")
+    if not hum then
+        hum = waitFor(character, "Humanoid", 5)
+    end
+    if not hum then return end
+
+    local diedConn
+    diedConn = hum.Died:Connect(function()
+        if diedConn then
+            pcall(function() diedConn:Disconnect() end)
+            diedConn = nil
+        end
+        stopFly()
+        stopWalk()
+        table.clear(S.invis.backup)
+    end)
+end
+
+LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
+if LocalPlayer.Character then
+    onCharacterAdded(LocalPlayer.Character)
+end
+
+--==================== 12. 主循环 ====================
+local acc = 0
+local fpsCount = 0
+local fpsTimer = os.clock()
+
+RunService.Heartbeat:Connect(function(deltaTime)
+    acc = acc + deltaTime
+    fpsCount = fpsCount + 1
+
+    if S.noclip then
+        applyNoclip()
+    end
+
+    if acc >= CONFIG.espInterval then
+        acc = 0
+        updateESP()
+        antiVoidTick()
+        if S.third.on then
+            pcall(function()
+                LocalPlayer.CameraMode = Enum.CameraMode.Classic
+            end)
+        end
+    end
+
+    local now = os.clock()
+    if now - fpsTimer >= 1 then
+        local ping = 0
+        pcall(function()
+            local item = Stats.Network.ServerStatsItem["Data Ping"]
+            if item then ping = math.floor(item:GetValue() + 0.5) end
+        end)
+        if statusLabel and statusLabel.Parent then
+            statusLabel.Text = string.format("FPS %d  |  PING %dms  |  %s", fpsCount, ping, tostring(game.PlaceId))
+        end
+        fpsCount = 0
+        fpsTimer = now
+    end
+end)
+
+--==================== 13. 远端配置（可选，默认关闭） ====================
+local adminIds = {}
+local blacklistIds = {}
+
+local function loadRemoteList(url, label)
+    if not CONFIG.remote.enabled then
+        return nil
+    end
+    local ok, data = pcall(function()
+        local body = game:HttpGet(url, true)
+        local chunk = loadstring(body)
+        if not chunk then
+            return nil
+        end
+        local res = chunk()
+        if type(res) ~= "table" then
+            return nil
+        end
+        local out = {}
+        for _, v in pairs(res) do
+            if type(v) == "number" or type(v) == "string" then
+                table.insert(out, tonumber(v) or v)
+            end
+        end
+        return out
+    end)
+    if ok and data then
+        notify("远端", string.format("%s 加载 %d 条", label, #data))
+        return data
+    end
+    notify("远端", label .. " 加载失败（地址可能已失效）")
+    return nil
+end
+
+adminIds = loadRemoteList(CONFIG.remote.adminUrl, "管理员") or {}
+blacklistIds = loadRemoteList(CONFIG.remote.kickUrl, "黑名单") or {}
+
+--==================== 14. 游戏模块分发 ====================
+-- 说明：原版把 ohio / wanted / Dueling ... 等模块当作全局函数直接调用，
+-- 但那些函数的定义体并不在这个文件里（“全源”通常由外部拼接）。
+-- 这里改成运行时解析 + 缺失时明确提示，不再抛 nil call。
+local moduleTable = {
+    [2820580801] = { name = "俄亥俄州 (Ohio)", entry = "ohio" },
+    [4987856151] = { name = "通缉 (Wanted)", entry = "wanted" },
+    [9051406594] = { name = "决斗场 (Dueling Grounds)", entry = "Dueling" },
+    [8795154789] = { name = "闪光 (Flick)", entry = "Flick" },
+    [9126204352] = { name = "刀刃战利品 (Slasher Blade Loot)", entry = "SBL" },
+    [6161049307] = { name = "像素之刃 (Pixel Blade)", entry = "PB" },
+    [1268927906] = { name = "力量传奇 (Muscle Legends)", entry = "LLCQ" },
+    [1119466531] = { name = "速度传奇 (Speed Legends)", entry = "SDCQ" },
+    [8779464785] = { name = "点击模拟器 (Tap Simulator)", entry = "DJMNQ" },
+    [9363735110] = { name = "逃出海啸 (Escape Tsunami)", entry = "ETFB" },
+    [1494262959] = { name = "犯罪 (Criminality)", entry = "CR" },
+    [1390601379] = { name = "战斗勇士 (CW)", entry = "CW" },
+    [8950496606] = { name = "亡命速递 (Deadly Delivery)", entry = "Deadly" },
+    [9323860275] = { name = "快速射击 (Quick Shot)", entry = "KSSJ" },
+    [3808081382] = { name = "最坚强的战场 (TSB)", entry = "TSB" },
+}
+
+local function resolveGlobal(name)
+    local env = nil
+    local ok, res = pcall(function()
+        if getgenv then return getgenv() end
+        return nil
+    end)
+    if ok then env = res end
+
+    if env and type(env[name]) == "function" then
+        return env[name]
+    end
+    if type(rawget(_G, name)) == "function" then
+        return rawget(_G, name)
+    end
+    return nil
+end
+
+local gameId = game.GameId
+local placeId = game.PlaceId
+local moduleInfo = moduleTable[gameId] or moduleTable[placeId]
+
+local key = generateKey()
+notify("校验", secureCheck(key) and "本地密钥通过" or "本地密钥不匹配（仅本地混淆，无实际防护）")
+
+if moduleInfo then
+    local entry = resolveGlobal(moduleInfo.entry)
+    if entry then
+        local ok, err = pcall(entry, key)
+        if ok then
+            notify("模块", "已加载：" .. moduleInfo.name)
+        else
+            notify("模块", "执行异常：" .. tostring(err))
+        end
+    else
+        notify("模块", string.format("%s 的入口函数 %s() 未内置，仅加载通用面板", moduleInfo.name, moduleInfo.entry))
+    end
+else
+    notify("系统", "当前服务器未在模块表中（GameId " .. tostring(gameId) .. "），仅加载通用面板")
+end
